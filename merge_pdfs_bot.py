@@ -1,7 +1,7 @@
 import os
 import logging
-import asyncio
 from pathlib import Path
+from flask import Flask, request, abort
 
 from telegram import Update
 from telegram.ext import (
@@ -16,12 +16,12 @@ from telegram.ext import (
 from PyPDF2 import PdfMerger
 
 # ──────────────────────────────────────────────
-# CONFIG
+# Config
 # ──────────────────────────────────────────────
 
 TOKEN = os.environ["TOKEN"]
 BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
-WEBHOOK_PATH = f"/{TOKEN}"  # secure: /<bot-token>
+WEBHOOK_PATH = f"/{TOKEN}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 TEMP_FOLDER = Path("pdf_temp")
@@ -30,25 +30,31 @@ MAX_PDFS = 99
 TEMP_FOLDER.mkdir(exist_ok=True)
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Flask app
+app = Flask(__name__)
+
+# Global application (we'll initialize later)
+application = None
+
 # ──────────────────────────────────────────────
-# STATES & HANDLERS
+# Conversation states & handlers
 # ──────────────────────────────────────────────
 
 WAITING_PDFS = 0
-
 
 async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Hi {user.first_name}! 📄\n"
-        "Send your PDF files one by one (max {MAX_PDFS})\n\n"
+        f"Send PDF files one by one (max {MAX_PDFS})\n\n"
         "When finished:\n"
-        "• /done   → merge them\n"
-        "• /cancel → abort"
+        "• /done   → merge files\n"
+        "• /cancel → abort everything"
     )
     context.user_data.clear()
     context.user_data["pdf_paths"] = []
@@ -62,36 +68,36 @@ async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     doc = update.message.document
     if not doc or not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("Please send only PDF files 😅")
+        await update.message.reply_text("Please send PDF files only 😅")
         return WAITING_PDFS
 
     paths: list[Path] = context.user_data.setdefault("pdf_paths", [])
     if len(paths) >= MAX_PDFS:
-        await update.message.reply_text(f"Reached max {MAX_PDFS} files! Send /done or /cancel")
+        await update.message.reply_text(f"Max {MAX_PDFS} files reached! Use /done or /cancel")
         return WAITING_PDFS
 
     file = await doc.get_file()
     path = TEMP_FOLDER / f"{update.effective_user.id}_{len(paths)+1}_{doc.file_name}"
-    await file.download_to_drive(custom_path=path)
+    await file.download_to_drive(path)
 
     paths.append(path)
 
-    await update.message.reply_text(f"Got {len(paths)}/{MAX_PDFS} • {doc.file_name}")
+    await update.message.reply_text(f"Received {len(paths)}/{MAX_PDFS} • {doc.file_name}")
     return WAITING_PDFS
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("state") != "collecting":
-        await update.message.reply_text("Nothing to merge right now 🤷‍♂️")
+        await update.message.reply_text("Nothing to merge 🤷‍♂️")
         return ConversationHandler.END
 
-    paths: list[Path] = context.user_data.get("pdf_paths", [])
+    paths = context.user_data.get("pdf_paths", [])
     if not paths:
-        await update.message.reply_text("No PDFs received yet 😕")
+        await update.message.reply_text("No PDFs were sent! 😕")
         context.user_data.clear()
         return ConversationHandler.END
 
-    await update.message.reply_text(f"Merging {len(paths)} PDFs... ⏳ Please wait")
+    await update.message.reply_text(f"Merging {len(paths)} PDFs... ⏳")
 
     merger = PdfMerger()
     output = TEMP_FOLDER / f"merged_{update.effective_user.id}.pdf"
@@ -99,22 +105,22 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         for p in paths:
             merger.append(p)
-        with open(output, "wb") as f_out:
-            merger.write(f_out)
+        with open(output, "wb") as f:
+            merger.write(f)
 
         await update.message.reply_document(
             document=output,
-            caption=f"Here is your merged PDF! ({len(paths)} files combined) 🎉"
+            caption=f"Your merged PDF is ready! ({len(paths)} files) 🎉"
         )
     except Exception as e:
         logger.error(f"Merge error: {e}")
-        await update.message.reply_text(f"Oops, merge failed 😢\nError: {str(e)[:180]}")
+        await update.message.reply_text(f"Merge failed 😢\nError: {str(e)[:180]}")
     finally:
         merger.close()
-        for file_path in paths + [output]:
+        for p in paths + [output]:
             try:
-                file_path.unlink(missing_ok=True)
-            except Exception:
+                p.unlink(missing_ok=True)
+            except:
                 pass
         context.user_data.clear()
 
@@ -122,23 +128,43 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    paths: list[Path] = context.user_data.get("pdf_paths", [])
-    for p in paths:
+    for p in context.user_data.get("pdf_paths", []):
         try:
             p.unlink(missing_ok=True)
-        except Exception:
+        except:
             pass
-
     context.user_data.clear()
-    await update.message.reply_text("Operation cancelled. All temporary files cleaned 🧹")
+    await update.message.reply_text("Cancelled. Files cleaned up 🧹")
     return ConversationHandler.END
 
 
 # ──────────────────────────────────────────────
-# MAIN — This is the correct pattern for v20+ webhook on Render
+# Flask routes
 # ──────────────────────────────────────────────
 
-async def main():
+@app.route("/health")
+def health_check():
+    return "OK", 200
+
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+async def webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_data = request.get_json()
+        update = Update.de_json(json_data, application.bot)
+        if update:
+            await application.process_update(update)
+        return "", 200
+    abort(403)
+
+
+# ──────────────────────────────────────────────
+# Startup
+# ──────────────────────────────────────────────
+
+def init_bot():
+    global application
+
     application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -156,22 +182,24 @@ async def main():
 
     application.add_handler(conv_handler)
 
-    # Important startup sequence
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
 
-    logger.info(f"Webhook set successfully → {WEBHOOK_URL}")
-
-    # This starts the webhook server and **blocks forever**
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 8443)),
-        url_path=WEBHOOK_PATH,
-        webhook_url=WEBHOOK_URL,
-        drop_pending_updates=True,
-    )
+@app.before_request
+async def before_request():
+    # Make sure bot is initialized
+    if application is None:
+        init_bot()
+        # Set webhook only once (on first request)
+        await application.initialize()
+        await application.start()
+        await application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        logger.info(f"Webhook set: {WEBHOOK_URL}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # For local testing
+    init_bot()
+    import asyncio
+    asyncio.run(application.initialize())
+    asyncio.run(application.start())
+    asyncio.run(application.bot.set_webhook(url="http://localhost:5000" + WEBHOOK_PATH))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
