@@ -1,8 +1,8 @@
-# merge_pdfs_bot.py   — full corrected version
-
 import os
 import logging
+import asyncio
 from pathlib import Path
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -16,16 +16,16 @@ from telegram.ext import (
 from PyPDF2 import PdfMerger
 
 # ──────────────────────────────────────────────
-#   CONFIG
+# CONFIG
 # ──────────────────────────────────────────────
 
 TOKEN = os.environ["TOKEN"]
 BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
-WEBHOOK_PATH = f"/{TOKEN}"
+WEBHOOK_PATH = f"/{TOKEN}"  # secure: /<bot-token>
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 TEMP_FOLDER = Path("pdf_temp")
-MAX_PDFS = 99   # you wanted 0-99 → max 99 files
+MAX_PDFS = 99
 
 TEMP_FOLDER.mkdir(exist_ok=True)
 
@@ -35,18 +35,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────
-#   HANDLERS (same as before — just condensed a bit)
+# STATES & HANDLERS
 # ──────────────────────────────────────────────
 
 WAITING_PDFS = 0
+
 
 async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Hi {user.first_name}! 📄\n"
-        "Send PDF files one by one (max 99)\n\n"
-        "Finish with:\n"
-        "• /done  → merge\n"
+        "Send your PDF files one by one (max {MAX_PDFS})\n\n"
+        "When finished:\n"
+        "• /done   → merge them\n"
         "• /cancel → abort"
     )
     context.user_data.clear()
@@ -54,40 +55,43 @@ async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = "collecting"
     return WAITING_PDFS
 
+
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("state") != "collecting":
         return ConversationHandler.END
 
     doc = update.message.document
     if not doc or not doc.file_name.lower().endswith(".pdf"):
-        await update.message.reply_text("Please send PDF files only 😅")
+        await update.message.reply_text("Please send only PDF files 😅")
         return WAITING_PDFS
 
-    paths = context.user_data.setdefault("pdf_paths", [])
+    paths: list[Path] = context.user_data.setdefault("pdf_paths", [])
     if len(paths) >= MAX_PDFS:
-        await update.message.reply_text(f"Max {MAX_PDFS} files! Use /done or /cancel")
+        await update.message.reply_text(f"Reached max {MAX_PDFS} files! Send /done or /cancel")
         return WAITING_PDFS
 
     file = await doc.get_file()
     path = TEMP_FOLDER / f"{update.effective_user.id}_{len(paths)+1}_{doc.file_name}"
-    await file.download_to_drive(path)
+    await file.download_to_drive(custom_path=path)
+
     paths.append(path)
 
-    await update.message.reply_text(f"Received {len(paths)}/{MAX_PDFS} • {doc.file_name}")
+    await update.message.reply_text(f"Got {len(paths)}/{MAX_PDFS} • {doc.file_name}")
     return WAITING_PDFS
+
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("state") != "collecting":
-        await update.message.reply_text("Nothing to merge 🤷‍♂️")
+        await update.message.reply_text("Nothing to merge right now 🤷‍♂️")
         return ConversationHandler.END
 
-    paths = context.user_data.get("pdf_paths", [])
+    paths: list[Path] = context.user_data.get("pdf_paths", [])
     if not paths:
-        await update.message.reply_text("No PDFs received! 😕")
+        await update.message.reply_text("No PDFs received yet 😕")
         context.user_data.clear()
         return ConversationHandler.END
 
-    await update.message.reply_text(f"Merging {len(paths)} files... ⏳")
+    await update.message.reply_text(f"Merging {len(paths)} PDFs... ⏳ Please wait")
 
     merger = PdfMerger()
     output = TEMP_FOLDER / f"merged_{update.effective_user.id}.pdf"
@@ -95,42 +99,46 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         for p in paths:
             merger.append(p)
-        with open(output, "wb") as f:
-            merger.write(f)
+        with open(output, "wb") as f_out:
+            merger.write(f_out)
 
         await update.message.reply_document(
             document=output,
-            caption=f"Merged PDF ready! ({len(paths)} files) 🎉"
+            caption=f"Here is your merged PDF! ({len(paths)} files combined) 🎉"
         )
     except Exception as e:
-        logger.error(f"Merge failed: {e}")
-        await update.message.reply_text(f"Error during merge 😢\n{str(e)[:200]}")
+        logger.error(f"Merge error: {e}")
+        await update.message.reply_text(f"Oops, merge failed 😢\nError: {str(e)[:180]}")
     finally:
         merger.close()
-        for p in paths + [output]:
+        for file_path in paths + [output]:
             try:
-                p.unlink(missing_ok=True)
-            except:
+                file_path.unlink(missing_ok=True)
+            except Exception:
                 pass
         context.user_data.clear()
 
     return ConversationHandler.END
 
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    for p in context.user_data.get("pdf_paths", []):
+    paths: list[Path] = context.user_data.get("pdf_paths", [])
+    for p in paths:
         try:
             p.unlink(missing_ok=True)
-        except:
+        except Exception:
             pass
+
     context.user_data.clear()
-    await update.message.reply_text("Cancelled & cleaned 🧹")
+    await update.message.reply_text("Operation cancelled. All temporary files cleaned 🧹")
     return ConversationHandler.END
 
+
 # ──────────────────────────────────────────────
-#   MAIN — MANUAL startup (NO asyncio.run!)
+# MAIN — This is the correct pattern for v20+ webhook on Render
 # ──────────────────────────────────────────────
 
-def main():
+async def main():
     application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -148,15 +156,15 @@ def main():
 
     application.add_handler(conv_handler)
 
-    # Manual startup sequence — this is the key!
-    application.initialize()
-    application.start()
-    application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    # Important startup sequence
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
 
-    logger.info(f"Webhook successfully set → {WEBHOOK_URL}")
+    logger.info(f"Webhook set successfully → {WEBHOOK_URL}")
 
-    # Let PTB run the webhook server forever (blocks here)
-    application.updater.start_webhook(
+    # This starts the webhook server and **blocks forever**
+    await application.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 8443)),
         url_path=WEBHOOK_PATH,
@@ -164,9 +172,6 @@ def main():
         drop_pending_updates=True,
     )
 
-    # Keep the process alive
-    application.updater.idle()  # ← blocks until Ctrl+C / SIGTERM
-
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
