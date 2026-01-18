@@ -1,4 +1,4 @@
-flask[async]==3.0.3          # or latest 3.x version with async extra
+flask==3.0.3
 python-telegram-bot[webhooks]==20.8
 PyPDF2
 gunicorn==22.0.0
