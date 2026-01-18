@@ -1,2 +1,4 @@
-python-telegram-bot[webhooks]==20.8   # or latest 20.x
+flask==3.0.3
+python-telegram-bot[webhooks]==20.8
 PyPDF2
+gunicorn==22.0.0   # recommended for production
