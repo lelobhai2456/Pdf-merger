@@ -7,8 +7,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
-ENV PORT=10000
+# Optional: create temp folder (though your code already does mkdir)
+RUN mkdir -p pdf_temp
 
-EXPOSE 10000
-
-CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "app:app"]
+# Use shell form so $PORT expands correctly
+CMD gunicorn --bind 0.0.0.0:${PORT:-10000} app:app --log-level info
